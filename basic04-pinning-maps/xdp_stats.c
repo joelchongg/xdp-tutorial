@@ -191,7 +191,7 @@ static void stats_collect(int map_fd, __u32 map_type,
 	}
 }
 
-static void stats_poll(int map_fd, __u32 map_type, int interval)
+static void stats_poll(int map_fd, __u32 map_type, __u32 map_id, int interval, char *pin_dir)
 {
 	struct stats_record prev, record = { 0 };
 
@@ -201,8 +201,29 @@ static void stats_poll(int map_fd, __u32 map_type, int interval)
 	/* Get initial reading quickly */
 	stats_collect(map_fd, map_type, &record);
 	usleep(1000000/4);
-
+	
 	while (1) {
+		/* if the BPF map was reloaded by xdp_loader, then we replace it */
+		struct bpf_map_info info = {0};
+		int new_fd;
+
+		new_fd = open_bpf_map_file(pin_dir, "xdp_stats_map", &info);
+		if (new_fd < 0) {
+			sleep(interval);
+			continue;
+		}
+
+		if (info.id != map_id) {
+			close(map_fd);
+			map_fd = new_fd;
+			map_id = info.id;
+			stats_collect(map_fd, map_type, &record);
+			sleep(interval);
+			continue;
+		} else {
+			close(new_fd);
+		}
+
 		prev = record; /* struct copy */
 		stats_collect(map_fd, map_type, &record);
 		stats_print(&record, &prev);
@@ -270,6 +291,6 @@ int main(int argc, char **argv)
 		       );
 	}
 
-	stats_poll(stats_map_fd, info.type, interval);
+	stats_poll(stats_map_fd, info.type, info.id, interval, pin_dir);
 	return EXIT_OK;
 }

@@ -132,7 +132,7 @@ void unpin_map(struct config *cfg)
 
 int main(int argc, char **argv)
 {
-	struct xdp_program *program;
+	struct xdp_program *prog;
 	int err, len;
 
 	struct config cfg = {
@@ -175,8 +175,61 @@ int main(int argc, char **argv)
 		return EXIT_OK;
 	}
 
-	program = load_bpf_and_xdp_attach(&cfg);
-	if (!program) {
+	int prog_fd = -1;
+	DECLARE_LIBBPF_OPTS(bpf_object_open_opts, opts);
+	DECLARE_LIBXDP_OPTS(xdp_program_opts, xdp_opts, 0);
+
+	xdp_opts.open_filename = cfg.filename;
+	xdp_opts.prog_name = cfg.progname;
+	xdp_opts.opts = &opts;
+
+	prog = xdp_program__create(&xdp_opts);
+	err = libxdp_get_error(prog);
+	if (err) {
+		char errmsg[1024];
+		libxdp_strerror(err, errmsg, sizeof(errmsg));
+		fprintf(stderr, "ERR: loading program: %s\n", errmsg);
+		exit(EXIT_FAIL_BPF);
+	}
+
+	struct bpf_object *bpf_obj = xdp_program__bpf_obj(prog);
+	if (!bpf_obj) {
+		exit(EXIT_FAIL_BPF);
+	}
+
+
+	struct bpf_map *map = bpf_object__find_map_by_name(bpf_obj, "xdp_stats_map");
+	int prev_pinned_map_fd = -1;
+	bool reused_map = false;
+	char map_filename[PATH_MAX];
+
+	len = snprintf(map_filename, PATH_MAX, "%s/%s", cfg.pin_dir, map_name);
+	prev_pinned_map_fd = bpf_obj_get(map_filename);
+
+	if (map && !(prev_pinned_map_fd < 0)) {
+		if (bpf_map__reuse_fd(map, prev_pinned_map_fd) < 0) {
+			/* upon failure to reuse map, fallback to the original logic of unpinning and repinning */
+			fprintf(stderr, "failed to reuse previous map\n");
+		} else {
+			fprintf(stdout, "reusing same map\n");
+			reused_map = true;
+		}
+
+		if (prev_pinned_map_fd != -1) close(prev_pinned_map_fd);
+	}
+
+	err = xdp_program__attach(prog, cfg.ifindex, cfg.attach_mode, 0);
+	if (err)
+		exit(err);
+
+	prog_fd = xdp_program__fd(prog);
+	if (prog_fd < 0) {
+		fprintf(stderr, "ERR: xdp_program__fd failed: %s\n", strerror(errno));
+		exit(EXIT_FAIL_BPF);
+	}
+
+	// program = load_bpf_and_xdp_attach(&cfg);
+	if (!prog) {
 		err = EXIT_FAIL_BPF;
 		goto out;
 	}
@@ -189,15 +242,17 @@ int main(int argc, char **argv)
 	}
 
 	/* Use the --dev name as subdir for exporting/pinning maps */
-	err = pin_maps_in_bpf_object(xdp_program__bpf_obj(program), &cfg);
-	if (err) {
-		fprintf(stderr, "ERR: pinning maps\n");
-		goto out;
+	if (!reused_map) {
+		err = pin_maps_in_bpf_object(xdp_program__bpf_obj(prog), &cfg);
+		if (err) {
+			fprintf(stderr, "ERR: pinning maps\n");
+			goto out;
+		}
 	}
 
 	err = EXIT_OK;
 
 out:
-	xdp_program__close(program);
+	xdp_program__close(prog);
 	return err;
 }
